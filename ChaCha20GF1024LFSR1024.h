@@ -8,19 +8,25 @@
 // Define CHACHA20GF1024LFSR1024_FORCE_PORTABLE consistently in all translation
 // units to disable PCLMUL and the four-block ChaCha SIMD path.
 //
-// Output: original GF1024/ChaCha stream XOR an independent AGHP LFSR mask.
-// The LFSR mask is the coefficient sequence of A(z)/Q(z), where Q is uniformly
+// Output: original GF1024/ChaCha stream XOR three independent AGHP LFSR masks.
+// Each LFSR mask is the coefficient sequence of A(z)/Q(z), where Q is uniformly
 // chosen among monic irreducible degree-1024 binary polynomials and A is an
-// independent uniform polynomial of degree < 1024. Its coefficients are output
+// independent uniform polynomial of degree < 1024. All three (Q,A) pairs are
+// independent of each other and of the GF/ChaCha seed. Coefficients are output
 // LSB-first in each uint64_t. This is the rational-series form of AGHP's LFSR;
 // multiplication by Q maps the first 1024 sequence bits bijectively to A.
 //
 // With independent ideal seeds, for each fixed public stream_id:
 //  * Any <=1024 distinct output words remain exactly jointly uniform.
 //  * Every fixed nonempty bit parity over the 2^128-word domain has bias
-//    <= (2^134-1)/(2^1024-2^512) < 2^-889.
-//  * Any 1600 distinct output bits have total variation distance < 2^-90
+//    <= ((2^134-1)/(2^1024-2^512))^3 < 2^-2667.
+//  * Any 5000 distinct output bits have total variation distance < 2^-168
 //    from ideal independent bits (TV uses half the L1 distance).
+//  * Every fixed GF(2) polynomial p of degree <=3 over the full bit domain:
+//    |E[(-1)^p(R)] - E[(-1)^p(U)]| < 2^-218.25 for ideal uniform U.
+//    The probability error is half this bound, not a bias relative to 1/2.
+//    Viola, Theorem 2: https://eccc.weizmann.ac.il/report/2007/132/download
+//    Independent GF/ChaCha XOR preserves it: p(x XOR M) has the same degree bound.
 // These are ensemble guarantees, not tests of a particular initialized stream.
 // They do not cover adaptive seed-dependent parity choices, joint use of
 // different stream IDs with one seed, or independence from a disclosed seed.
@@ -29,14 +35,16 @@
 // k-wise Independent Random Variables", section 3, construction 1:
 // https://web.math.princeton.edu/~nalon/PDFS/aghp4.pdf
 //
-// Serialized seed (16672 bytes, little-endian):
+// Serialized seed (17184 bytes, little-endian; incompatible with old seeds):
 //   [0,32)       ChaCha key
 //   [32,16416)   1024 GF(2^128) monomial coefficients (original layout)
-//   [16416,16544) Q coefficients z^0..z^1023; z^1024 is implicit, Q(0)=1
-//   [16544,16672) A coefficients z^0..z^1023
-// The Q part is STRUCTURED: arbitrary bytes are not a valid full seed.
-// prepare_seed checks irreducibility exactly; checking cannot establish that
-// Q was uniformly selected. make_seed performs unbiased rejection sampling
+//   [16416,16672) Q0 then A0 (128 bytes each)
+//   [16672,16928) Q1 then A1 (128 bytes each)
+//   [16928,17184) Q2 then A2 (128 bytes each)
+// Each Q has implicit z^1024 and Q(0)=1. Q/A bits encode degrees 0..1023.
+// All Q parts are STRUCTURED: arbitrary bytes are not a valid full seed.
+// prepare_seed checks every Q for irreducibility; it cannot establish sampling
+// uniformity or independence. make_seed performs separate rejection sampling
 // when its callback supplies fresh independent uniform bytes.
 // Zero numerator A is accepted, as required by this distribution.
 // Never derive this extra seed from the ChaCha key when claiming the theorems.
@@ -51,11 +59,10 @@
 //   RNG restored(bytes, 0);                // validates Q and rebuilds tables
 //
 // uint64_t/default constructors use deterministic SplitMix64 convenience
-// seeding and provide NEITHER full-entropy theorem. Initialization can be
+// seeding and provide NONE of the ideal-seed distribution theorems. Initialization can be
 // expensive; prepare once and reuse PreparedSeed or copy a generator.
 // next_bit has a separate word reservoir, as in the previous implementation.
 // For one contiguous bit stream do not interleave next_bit and word APIs.
-// No compilation, execution, or benchmark was performed when creating this file.
 
 #include <array>
 #include <memory>
@@ -1691,7 +1698,11 @@ public:
     static constexpr std::size_t GF_ELEMENT_BYTES = Base::GF_ELEMENT_BYTES;
     static constexpr std::size_t GF_SEED_BYTES = Base::GF_SEED_BYTES;
     static constexpr std::size_t BASE_SEED_BYTES = Base::FULL_SEED_BYTES;
-    static constexpr std::size_t LFSR_SEED_BYTES = Mask::SEED_BYTES;
+    // Exactly three AGHP masks; this is not a configurable generator parameter.
+    static constexpr std::size_t LFSR_COMPONENTS = 3;
+    static constexpr std::size_t LFSR_COMPONENT_SEED_BYTES = Mask::SEED_BYTES;
+    static constexpr std::size_t LFSR_SEED_BYTES = LFSR_COMPONENTS * LFSR_COMPONENT_SEED_BYTES;
+    // Legacy names identify component zero. Use the indexed helpers for all three.
     static constexpr std::size_t LFSR_POLYNOMIAL_OFFSET = BASE_SEED_BYTES;
     static constexpr std::size_t LFSR_NUMERATOR_OFFSET = BASE_SEED_BYTES + Mask::POLY_BYTES;
     static constexpr std::size_t FULL_SEED_BYTES = BASE_SEED_BYTES + LFSR_SEED_BYTES;
@@ -1699,6 +1710,20 @@ public:
     static constexpr std::size_t FFT_SIZE = Base::FFT_SIZE;
     static constexpr std::size_t OUTPUT_WORDS_PER_FFT = Base::OUTPUT_WORDS_PER_FFT;
     using Seed = std::array<uint8_t, FULL_SEED_BYTES>;
+
+    // component must be in [0, LFSR_COMPONENTS).
+    static constexpr std::size_t lfsr_polynomial_offset(std::size_t component)
+    {
+        return BASE_SEED_BYTES + component * LFSR_COMPONENT_SEED_BYTES;
+    }
+    static constexpr std::size_t lfsr_numerator_offset(std::size_t component)
+    {
+        return lfsr_polynomial_offset(component) + Mask::POLY_BYTES;
+    }
+
+private:
+    using ParameterSet = std::array<Mask::SharedParameters, LFSR_COMPONENTS>;
+public:
 
     // Immutable sampled/validated seed plus expensive precomputed tables.
     // Construct through make_seed or prepare_seed, then share among instances.
@@ -1713,8 +1738,8 @@ public:
     private:
         friend class ChaCha20GF1024LFSR1024;
         Seed bytes_;
-        Mask::SharedParameters parameters_;
-        PreparedSeed(Seed bytes, Mask::SharedParameters parameters)
+        ParameterSet parameters_;
+        PreparedSeed(Seed bytes, ParameterSet parameters)
             : bytes_(std::move(bytes)), parameters_(std::move(parameters)) {}
     };
 
@@ -1729,24 +1754,31 @@ public:
             throw std::invalid_argument("ChaCha20GF1024LFSR1024: attempt limit is zero");
         Seed bytes{};
         fill(bytes.data(), BASE_SEED_BYTES);
-        auto parameters = Mask::sample(bytes.data() + LFSR_POLYNOMIAL_OFFSET,
-                                       fill, max_polynomial_attempts);
-        fill(bytes.data() + LFSR_NUMERATOR_OFFSET, Mask::POLY_BYTES);
+        ParameterSet parameters;
+        for (std::size_t j = 0; j < LFSR_COMPONENTS; ++j) {
+            // Fresh bytes for every Q and A. The candidate limit is per Q.
+            // Independently sampled equal polynomials are valid; do not reject them.
+            parameters[j] = Mask::sample(bytes.data() + lfsr_polynomial_offset(j),
+                                         fill, max_polynomial_attempts);
+            fill(bytes.data() + lfsr_numerator_offset(j), Mask::POLY_BYTES);
+        }
         return PreparedSeed(std::move(bytes), std::move(parameters));
     }
 
     static PreparedSeed prepare_seed(const Seed& bytes)
     {
-        auto parameters = Mask::prepare(bytes.data() + LFSR_POLYNOMIAL_OFFSET);
+        ParameterSet parameters;
+        for (std::size_t j = 0; j < LFSR_COMPONENTS; ++j)
+            parameters[j] = Mask::prepare(bytes.data() + lfsr_polynomial_offset(j));
         return PreparedSeed(bytes, std::move(parameters));
     }
 
     // A checked byte-count overload prevents accidentally importing a former
-    // 16416-byte GF1024 seed as the new 16672-byte serialized seed.
+    // 16416-byte GF seed or 16672-byte one-mask seed as the new three-mask seed.
     static PreparedSeed prepare_seed(const uint8_t* bytes, std::size_t size)
     {
         if (bytes == nullptr || size != FULL_SEED_BYTES)
-            throw std::invalid_argument("ChaCha20GF1024LFSR1024: expected 16672 seed bytes");
+            throw std::invalid_argument("ChaCha20GF1024LFSR1024: expected 17184 seed bytes (three AGHP masks)");
         Seed copy{};
         std::memcpy(copy.data(), bytes, copy.size());
         return prepare_seed(copy);
@@ -1754,7 +1786,9 @@ public:
 
     explicit ChaCha20GF1024LFSR1024(const PreparedSeed& seed, uint64_t stream_id = 0)
         : base_(seed.bytes_.data(), stream_id),
-          mask_(seed.parameters_, seed.bytes_.data() + LFSR_NUMERATOR_OFFSET)
+          masks_{{Mask(seed.parameters_[0], seed.bytes_.data() + lfsr_numerator_offset(0)),
+                  Mask(seed.parameters_[1], seed.bytes_.data() + lfsr_numerator_offset(1)),
+                  Mask(seed.parameters_[2], seed.bytes_.data() + lfsr_numerator_offset(2))}}
     {
     }
 
@@ -1769,8 +1803,8 @@ public:
     {
     }
 
-    // Deterministic convenience only. Neither information-theoretic seed
-    // assumption is satisfied. No theorem follows from merely passing the
+    // Deterministic convenience only. The ideal independent-seed assumptions
+    // are not satisfied. No theorem follows from merely passing the
     // irreducibility check. Prefer a reusable PreparedSeed in performance work.
     explicit ChaCha20GF1024LFSR1024(uint64_t seed, uint64_t stream_id = 0)
         : ChaCha20GF1024LFSR1024(make_deterministic_seed(seed), stream_id)
@@ -1781,9 +1815,11 @@ public:
 
     uint64_t next_int()
     {
-        // Base checks exhaustion before either component advances.
-        const uint64_t word = base_.next_int();
-        return word ^ mask_.next_word();
+        // Base checks exhaustion before any mask advances.
+        uint64_t word = base_.next_int();
+        for (auto& mask : masks_)
+            word ^= mask.next_word();
+        return word;
     }
 
     void generate(uint64_t* dst, std::size_t count)
@@ -1795,11 +1831,12 @@ public:
         if (base_.exhausted())
             throw std::overflow_error("ChaCha20GF1024LFSR1024: position space exhausted");
         validate_range(base_.position128(), count);
-        // Fuse the mask while each GF-sized output chunk is still cache-hot.
+        // Apply all three masks while each GF-sized output chunk is cache-hot.
         while (count != 0) {
             const std::size_t chunk = std::min(count, OUTPUT_WORDS_PER_FFT);
             base_.generate(dst, chunk);
-            mask_.xor_words(dst, chunk);
+            for (auto& mask : masks_)
+                mask.xor_words(dst, chunk);
             dst += chunk;
             count -= chunk;
         }
@@ -1819,7 +1856,8 @@ public:
         // No mutable global/lazy tables: concurrent seeks in independent
         // copies only read the immutable shared parameters.
         if (position != base_.position128() || base_.exhausted()) {
-            mask_.seek(position);
+            for (auto& mask : masks_)
+                mask.seek(position);
             base_.seek(position);
         }
         current_bits_ = 0;
@@ -1831,7 +1869,7 @@ public:
     bool exhausted() const noexcept { return base_.exhausted(); }
 
     // Does not change this instance's position, mask state or bit reservoir.
-    // Copies inherit the same GF coefficients and LFSR seed. No reseeding and
+    // Copies inherit the same GF coefficients and all three LFSR seeds. No reseeding and
     // no altered stream IDs. Start positions may be full 128-bit word indices.
     // Do not mutate this instance concurrently with this call.
     void generate_parallel_at(uint64_t* dst, std::size_t count, Position start,
@@ -1916,7 +1954,7 @@ public:
         const int reservoir_index = bit_index_;
         if (last.is_max()) {
             seek(last);
-            (void)next_int(); // advance both components and mark exhaustion
+            (void)next_int(); // advance all components and mark exhaustion
         }
         else {
             Position next = last;
@@ -1929,7 +1967,7 @@ public:
 
     static constexpr std::size_t gf_seed_state_bytes() { return GF_SEED_BYTES; }
     static constexpr std::size_t gf_cached_block_bytes() { return Base::gf_cached_block_bytes(); }
-    static constexpr std::size_t lfsr_shared_table_bytes() { return sizeof(Mask::Parameters); }
+    static constexpr std::size_t lfsr_shared_table_bytes() { return LFSR_COMPONENTS * sizeof(Mask::Parameters); }
     static bool debug_cpu_has_pclmul() { return Base::debug_cpu_has_pclmul(); }
     static Field debug_gf_mul_portable(Field a, Field b) { return Base::debug_gf_mul_portable(a, b); }
     static Field debug_gf_mul_fast(Field a, Field b) { return Base::debug_gf_mul_fast(a, b); }
@@ -1939,14 +1977,21 @@ public:
     uint64_t debug_gf_fft(uint64_t p) { return base_.debug_gf_fft(p); }
     uint64_t debug_lfsr_word(Position p) const
     {
-        auto copy = mask_;
+        uint64_t word = 0;
+        for (std::size_t j = 0; j < LFSR_COMPONENTS; ++j)
+            word ^= debug_lfsr_component_word(j, p);
+        return word;
+    }
+    uint64_t debug_lfsr_component_word(std::size_t component, Position p) const
+    {
+        auto copy = masks_.at(component);
         copy.seek(p);
         return copy.next_word();
     }
 
 private:
     Base base_;
-    Mask mask_;
+    std::array<Mask, LFSR_COMPONENTS> masks_;
     uint64_t current_bits_ = 0;
     int bit_index_ = 64;
 

@@ -1,12 +1,12 @@
 // Build (GCC, on the benchmark machine):
 // g++ -std=c++17 -O3 -march=native -flto -DNDEBUG -pthread main.cpp -o chacha20gf1024lfsr1024
 // Run: ./chacha20gf1024lfsr1024 30000000 4 [full]
-// Requires the unchanged ChaCha20GF1024LFSR1024.h and toy_kwise_1024_test.h.
-// This adaptation has not been compiled or executed.
+// Requires the core, seed/parallel headers, toy suite and parallel regression header.
 #include "ChaCha20GF1024LFSR1024.h"
 #include "ChaCha20GF1024LFSR1024Parallel.h"
 #include "ChaCha20GF1024LFSR1024Seed.h"
 #include "toy_kwise_1024_test.h"
+#include "tests/parallel_identity_test.h"
 
 #include <algorithm>
 #include <chrono>
@@ -119,7 +119,8 @@ static bool test_embedded_polynomial_regression_vector()
                 RNG::GF_SEED_BYTES - old_gf_bytes);
     // Zero numerator is a valid LFSR state and produces a zero mask. This
     // preserves the existing known-answer vector; it is not a new LFSR vector.
-    std::memset(seed.data() + RNG::LFSR_NUMERATOR_OFFSET, 0, 128);
+    for (std::size_t j = 0; j < RNG::LFSR_COMPONENTS; ++j)
+        std::memset(seed.data() + RNG::lfsr_numerator_offset(j), 0, 128);
     ChaCha20GF1024LFSR1024 rng(seed);
     for (uint64_t v : expected)
         if (rng.next_int() != v) return false;
@@ -161,12 +162,12 @@ struct BitSerialLfsrReference
     uint64_t q[16]{};
     uint64_t a[16]{};
 
-    explicit BitSerialLfsrReference(const RNG::Seed& seed)
+    BitSerialLfsrReference(const RNG::Seed& seed, std::size_t component)
     {
         for (std::size_t i = 0; i < 16; ++i) {
             for (unsigned b = 0; b < 8; ++b) {
-                q[i] |= uint64_t(seed[RNG::LFSR_POLYNOMIAL_OFFSET + 8 * i + b]) << (8 * b);
-                a[i] |= uint64_t(seed[RNG::LFSR_NUMERATOR_OFFSET + 8 * i + b]) << (8 * b);
+                q[i] |= uint64_t(seed[RNG::lfsr_polynomial_offset(component) + 8 * i + b]) << (8 * b);
+                a[i] |= uint64_t(seed[RNG::lfsr_numerator_offset(component) + 8 * i + b]) << (8 * b);
             }
         }
     }
@@ -192,16 +193,25 @@ static bool test_lfsr_bit_reference()
     const auto& seed = reproducible_seed();
     RNG hybrid(seed);
     ChaCha20GF1024LFSR1024Counter128 chacha(seed.bytes().data());
-    BitSerialLfsrReference reference(seed.bytes());
+    std::vector<BitSerialLfsrReference> references;
+    for (std::size_t j = 0; j < RNG::LFSR_COMPONENTS; ++j)
+        references.emplace_back(seed.bytes(), j);
     const uint64_t seeks[] = {0, 1, 15, 16, 17, 1023, 1024, 2047, 2048, 4098};
     std::size_t next_seek = 0;
     for (uint64_t i = 0; i <= 4098; ++i) {
-        const uint64_t mask = reference.next_word();
+        uint64_t mask = 0;
+        const bool check_seek = next_seek < sizeof(seeks) / sizeof(seeks[0]) && i == seeks[next_seek];
+        for (std::size_t j = 0; j < RNG::LFSR_COMPONENTS; ++j) {
+            const uint64_t component = references[j].next_word();
+            mask ^= component;
+            if (check_seek && hybrid.debug_lfsr_component_word(j, Position128(i)) != component)
+                return false;
+        }
         const Field128 gf = hybrid.debug_gf_fft128(Position128(i / 2));
         const uint64_t expected = chacha.next_int() ^ ((i & 1) ? gf.hi : gf.lo) ^ mask;
         if (hybrid.next_int() != expected)
             return false;
-        if (next_seek < sizeof(seeks) / sizeof(seeks[0]) && i == seeks[next_seek]) {
+        if (check_seek) {
             if (hybrid.debug_lfsr_word(Position128(i)) != mask)
                 return false;
             ++next_seek;
@@ -213,23 +223,97 @@ static bool test_lfsr_bit_reference()
 static bool test_structured_seed()
 {
     const auto& seed = reproducible_seed();
-    RNG original(seed), restored(seed.bytes());
+    static_assert(RNG::LFSR_COMPONENTS == 3 && RNG::FULL_SEED_BYTES == 17184,
+                  "fixed three-mask seed layout");
+    RNG original(seed), restored(seed.bytes()),
+        restored_pointer(seed.bytes().data(), seed.bytes().size());
     for (unsigned i = 0; i < 64; ++i)
-        if (original.next_int() != restored.next_int()) return false;
+        if (const uint64_t word = original.next_int();
+            word != restored.next_int() || word != restored_pointer.next_int()) return false;
 
-    RNG::Seed bad = seed.bytes();
-    bad[RNG::LFSR_POLYNOMIAL_OFFSET] &= uint8_t{0xfe};
-    bool even_rejected = false;
-    try { (void)RNG::prepare_seed(bad); }
-    catch (const std::invalid_argument&) { even_rejected = true; }
+    for (std::size_t j = 0; j < RNG::LFSR_COMPONENTS; ++j) {
+        RNG::Seed bad = seed.bytes();
+        const std::size_t offset = RNG::lfsr_polynomial_offset(j);
+        bad[offset] &= uint8_t{0xfe};
+        bool even_rejected = false;
+        try { (void)RNG::prepare_seed(bad); }
+        catch (const std::invalid_argument&) { even_rejected = true; }
 
-    // Q = z^1024+1 is reducible, despite having the required constant bit.
-    std::memset(bad.data() + RNG::LFSR_POLYNOMIAL_OFFSET, 0, 128);
-    bad[RNG::LFSR_POLYNOMIAL_OFFSET] = 1;
-    bool reducible_rejected = false;
-    try { (void)RNG::prepare_seed(bad); }
-    catch (const std::invalid_argument&) { reducible_rejected = true; }
-    return even_rejected && reducible_rejected;
+        // Q = z^1024+1 is reducible, despite its required constant bit.
+        std::memset(bad.data() + offset, 0, 128);
+        bad[offset] = 1;
+        bool reducible_rejected = false;
+        try { (void)RNG::prepare_seed(bad); }
+        catch (const std::invalid_argument&) { reducible_rejected = true; }
+        if (!even_rejected || !reducible_rejected) return false;
+    }
+    for (std::size_t size : {std::size_t{16416}, std::size_t{16672},
+                             RNG::FULL_SEED_BYTES - 1, RNG::FULL_SEED_BYTES + 1}) {
+        bool rejected = false;
+        try { (void)RNG::prepare_seed(seed.bytes().data(), size); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) return false;
+    }
+
+    // Identical Q values are valid: independence is a sampling property, not
+    // a uniqueness constraint. Equal first two masks cancel; the third remains.
+    RNG::Seed repeated = seed.bytes();
+    std::copy_n(repeated.data() + RNG::lfsr_polynomial_offset(0),
+                RNG::LFSR_COMPONENT_SEED_BYTES,
+                repeated.data() + RNG::lfsr_polynomial_offset(1));
+    RNG repeated_rng(repeated);
+    for (uint64_t i = 0; i < 20; ++i)
+        if (repeated_rng.debug_lfsr_word(Position128(i)) !=
+            repeated_rng.debug_lfsr_component_word(2, Position128(i))) return false;
+    return true;
+}
+
+// Scripted byte source verifies sampling calls and per-component retry limits,
+// not entropy. Each Q first receives a reducible candidate, then a valid one.
+static bool test_three_mask_sampling()
+{
+    const auto& bytes = reproducible_seed().bytes();
+    std::size_t calls = 0;
+    auto fill = [&](uint8_t* dst, std::size_t count) {
+        const std::size_t call = calls++;
+        if (call == 0) {
+            if (count != RNG::BASE_SEED_BYTES) throw std::logic_error("base seed fill size");
+            std::copy_n(bytes.data(), count, dst);
+            return;
+        }
+        const std::size_t component = (call - 1) / 3;
+        const std::size_t step = (call - 1) % 3;
+        if (component >= RNG::LFSR_COMPONENTS || count != 128)
+            throw std::logic_error("AGHP seed fill sequence");
+        if (step == 0) {
+            std::memset(dst, 0, count); // becomes Q=z^1024+1, rejected
+        } else {
+            const std::size_t offset = step == 1
+                ? RNG::lfsr_polynomial_offset(component) : RNG::lfsr_numerator_offset(component);
+            std::copy_n(bytes.data() + offset, count, dst);
+        }
+    };
+    const auto sampled = RNG::make_seed(fill, 2);
+    if (calls != 10 || sampled.bytes() != bytes) return false;
+
+    // Exhausting the limit for any Q must fail, without a substituted polynomial.
+    for (std::size_t fail_at = 0; fail_at < RNG::LFSR_COMPONENTS; ++fail_at) {
+        std::size_t call = 0;
+        auto fail_fill = [&](uint8_t* dst, std::size_t count) {
+            const std::size_t index = call++;
+            if (index == 0) { std::copy_n(bytes.data(), count, dst); return; }
+            const std::size_t component = (index - 1) / 2;
+            if (component == fail_at) { std::memset(dst, 0, count); return; }
+            const std::size_t offset = index % 2
+                ? RNG::lfsr_polynomial_offset(component) : RNG::lfsr_numerator_offset(component);
+            std::copy_n(bytes.data() + offset, count, dst);
+        };
+        bool rejected = false;
+        try { (void)RNG::make_seed(fail_fill, 1); }
+        catch (const std::runtime_error&) { rejected = true; }
+        if (!rejected || call != 2 + 2 * fail_at) return false;
+    }
+    return true;
 }
 
 static bool test_gf_arithmetic()
@@ -605,6 +689,7 @@ static int run_main(int argc, char** argv)
     std::printf("GF seed size:              %zu bytes\n",
         RNG::GF_SEED_BYTES);
     std::printf("LFSR seed size:            %zu bytes\n", RNG::LFSR_SEED_BYTES);
+    std::printf("AGHP components (fixed):  %zu\n", RNG::LFSR_COMPONENTS);
     std::printf("Shared LFSR tables:        %zu bytes\n", RNG::lfsr_shared_table_bytes());
     std::printf("Preparing reproducible structured seed (outside benchmarks)...\n");
     std::fflush(stdout);
@@ -628,6 +713,8 @@ static int run_main(int argc, char** argv)
         checked(test_lfsr_bit_reference()));
     std::printf("Structured seed checks:   %s\n",
         checked(test_structured_seed()));
+    std::printf("Three-mask sampling:      %s\n",
+        checked(test_three_mask_sampling()));
     std::printf("GF(2^128) fast/ref:        %s\n",
         checked(test_gf_arithmetic()));
     std::printf("GF128 FFT vs Horner:       %s\n",
@@ -638,6 +725,7 @@ static int run_main(int argc, char** argv)
         checked(test_bulk_identity()));
     std::printf("Parallel identity x%u:      %s\n", threads,
         checked(test_parallel_identity(threads)));
+    all_ok &= run_parallel_identity_tests(reproducible_seed());
 
     if (!all_ok) {
         std::fprintf(stderr, "Core checks failed; benchmarks skipped.\n");

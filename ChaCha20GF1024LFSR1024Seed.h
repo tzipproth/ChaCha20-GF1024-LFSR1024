@@ -32,7 +32,8 @@
 #endif
 
 // RDSEED-first or explicit OS-only initialization for the structured seed.
-// The LFSR polynomial is sampled with the core's exact rejection procedure;
+// All three LFSR polynomials are independently sampled with the core's exact
+// rejection procedure, each followed by a fresh independent numerator;
 // filling the complete seed array directly with random bytes is NOT valid.
 // Neither RDSEED success nor OS CSPRNG output establishes the ideal entropy assumed
 // by the information-theoretic theorems. This helper provides practical seeding.
@@ -262,7 +263,7 @@ namespace chacha20gf1024lfsr1024_seed
         }
 
         // Start make_seed AGAIN: new ChaCha key, GF coefficients, denominator
-        // candidates and numerator. No RDSEED prefix survives into this seed.
+        // candidates and numerators for ALL THREE masks. No RDSEED prefix survives.
         auto fill = [&](std::uint8_t* dst, std::size_t bytes) {
             if (!os_random_bytes(dst, bytes))
                 throw std::runtime_error("OS random generator failed during seed fallback");

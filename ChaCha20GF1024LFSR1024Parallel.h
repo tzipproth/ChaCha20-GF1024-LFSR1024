@@ -16,6 +16,9 @@
 // Instead it evaluates disjoint position ranges of the SAME logical stream in
 // parallel. fill_parallel_at(..., start, ...) is bit-identical to a single
 // ChaCha20GF1024LFSR1024 seek(start) followed by the same number of next_int() calls.
+// Each worker inherits all three AGHP (Q,A) pairs and seeks all three masks to
+// its absolute word position. This preserves exact GF independence, the combined
+// small-bias bound and degree-3 polynomial fooling under the core seed assumptions.
 //
 // The middle of the requested range is split only at 2048-word GF/FFT output
 // boundaries, avoiding redundant additive-FFT blocks between workers. A short unaligned
@@ -29,8 +32,10 @@ public:
 
     using Seed = ChaCha20GF1024LFSR1024::Seed;
     using PreparedSeed = ChaCha20GF1024LFSR1024::PreparedSeed;
+    static constexpr std::size_t FULL_SEED_BYTES = ChaCha20GF1024LFSR1024::FULL_SEED_BYTES;
+    static constexpr std::size_t LFSR_COMPONENTS = ChaCha20GF1024LFSR1024::LFSR_COMPONENTS;
 
-    // Copies of the prototype share the prepared immutable LFSR jump tables.
+    // Copies share the three prepared immutable sets of LFSR jump tables.
     // Use this overload to keep seed preparation outside benchmark timings.
     explicit ChaCha20GF1024LFSR1024Parallel(const PreparedSeed& seed,
                                            std::uint64_t stream_id = 0)
@@ -233,6 +238,7 @@ private:
 
     static void validate_range(Position start, std::size_t count)
     {
+        static_assert(sizeof(std::size_t) <= sizeof(std::uint64_t), "size_t wider than supported");
         // Validate the last requested word, not the exclusive end. This allows
         // a one-word request at position 2^128-1.
         if (count == 0)
@@ -247,7 +253,7 @@ private:
                            Position start_position) const
     {
         // Copy the generator once per worker. FFT tables and prepared LFSR
-        // jump tables are shared read-only; mutable GF/LFSR state stays local.
+        // jump tables for all three masks are shared read-only; mutable states stay local.
         // The irreducibility test is NOT repeated by these copies.
         ChaCha20GF1024LFSR1024 worker = prototype_;
         worker.seek(start_position);
